@@ -19,6 +19,18 @@ import os
 import re
 import json
 
+
+#chunking
+
+def sync_in_chunks(api):
+    chunk_size = 99  # Maximum commands per request
+    while api.queue:
+        chunk = api.queue[:chunk_size]  # Get the next chunk
+        api.queue = api.queue[chunk_size:]  # Remove the processed chunk from the queue
+        sync(api, chunk)  # Sync the current chunk
+
+        logging.info('Synced chunk of %d commands.', chunk_size)
+
 # Connect to SQLite database
 
 
@@ -491,8 +503,7 @@ def commit_labels_update(api, overview_task_ids, overview_task_labels):
 
 # Update tasks in batch with Todoist Sync API
 
-
-def sync(api):
+def sync(api, chunk):
     # # This approach does not seem to work correctly.
     # BASE_URL = "https://api.todoist.com"
     # SYNC_VERSION = "v9"
@@ -510,7 +521,7 @@ def sync(api):
         }
 
         data = 'sync_token=' + api.sync_token + \
-            '&commands=' + json.dumps(api.queue)
+            '&commands=' + json.dumps(chunk)
 
         response = requests.post(
             'https://api.todoist.com/sync/v9/sync', headers=headers, data=data)
@@ -1520,8 +1531,10 @@ def main():
                                        overview_task_labels)
 
         # Sync all queued up changes
+#        if api.queue:
+#            sync(api)
         if api.queue:
-            sync(api)
+            sync_in_chunks(api)
 
         num_changes = len(api.queue)+len(api.overview_updated_ids)
 
