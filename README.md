@@ -193,3 +193,13 @@ To build the docker container, check out the repository and run:
 To run autodoist inside the docker container:
 
     docker run -it autodoist:latest
+
+Docker-compose example:
+    
+    version: "3.7"
+    services:
+      autodoist:
+        image: ghcr.io/Hoffelhas/autodoist:laster
+        container_name: autodoist
+        command: -l=next -hf=2 -a=**apikey**
+        restart: unless-stopped
