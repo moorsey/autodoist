@@ -20,7 +20,7 @@ import re
 import json
 
 
-#chunking
+#chunking code to meet API limits of 100 calls per request
 
 def sync_in_chunks(api):
     chunk_size = 99  # Maximum commands per request
@@ -1531,8 +1531,6 @@ def main():
                                        overview_task_labels)
 
         # Sync all queued up changes
-#        if api.queue:
-#            sync(api)
         if api.queue:
             sync_in_chunks(api)
 
