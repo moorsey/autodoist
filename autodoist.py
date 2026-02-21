@@ -4,7 +4,6 @@ from todoist_api_python.api import TodoistAPI
 from todoist_api_python.models import Task
 from todoist_api_python.models import Section
 from todoist_api_python.models import Project
-from todoist_api_python.http_requests import get
 from urllib.parse import urljoin
 from urllib.parse import quote
 import sys
@@ -293,13 +292,14 @@ def query_yes_no(question, default="yes"):
 
 def verify_label_existance(api, label_name, prompt_mode):
     # Check the regeneration label exists
-    labels = api.get_labels()
+    # In API v3, get_labels() returns a paginator that yields pages (lists)
+    labels = [label for page in api.get_labels() for label in page]
     label = [x for x in labels if x.name == label_name]
 
     if len(label) > 0:
-        next_action_label = label[0].id
+        next_action_label_id = label[0].id
         logging.debug('Label \'%s\' found as label id %s',
-                      label_name, next_action_label)
+                      label_name, next_action_label_id)
     else:
         # Create a new label in Todoist
         logging.info(
@@ -317,16 +317,18 @@ def verify_label_existance(api, label_name, prompt_mode):
             except Exception as error:
                 logging.warning(error)
 
-            labels = api.get_labels()
+            # In API v3, get_labels() returns a paginator
+            labels = [label for page in api.get_labels() for label in page]
             label = [x for x in labels if x.name == label_name]
-            next_action_label = label[0].id
+            next_action_label_id = label[0].id
 
             logging.info("Label '{}' has been created!".format(label_name))
         else:
             logging.info('Exiting Autodoist.')
             exit(1)
 
-    return labels
+    # Return the label ID as string (REST API v2 uses string IDs)
+    return str(next_action_label_id)
 
 # Initialisation of Autodoist
 
@@ -394,7 +396,18 @@ def initialise_api(args):
     if args.label is not None:
 
         # Verify that the next action label exists; ask user if it needs to be created
-        verify_label_existance(api, args.label, 1)
+        # Get the label ID - keep args.label as the name (for checking with REST API)
+        label_id = verify_label_existance(api, args.label, 1)
+        # Store the label ID for Sync API v1 (which uses IDs)
+        args.label_id = label_id
+        # Store label name for later use
+        args.label_name = args.label
+        logging.debug(f"Using label '{args.label}' with ID: {args.label_id}")
+
+        # Create ID to name mapping for all labels
+        all_labels = [label for page in api.get_labels() for label in page]
+        api.label_id_to_name = {label.id: label.name for label in all_labels}
+        api.label_name_to_id = {label.name: label.id for label in all_labels}
 
     # TODO: Disabled for now
     # # If regeneration mode is used, verify labels
@@ -464,11 +477,19 @@ def initialise_sync_api(api):
 
     try:
         response = requests.post(
-            'https://api.todoist.com/sync/v9/sync', headers=headers, data=data)
+            'https://api.todoist.com/api/v1/sync', headers=headers, data=data)
+
+        # Check status code before parsing JSON
+        if response.status_code == 200:
+            return response.json()
+
+        # Log error details for debugging
+        logging.error(f"Sync API error {response.status_code}: {response.text[:200]}")
+        response.raise_for_status()
+
     except Exception as e:
         logging.error(f"Error during initialise_sync_api: '{e}'")
-
-    return json.loads(response.text)
+        raise
 
 # Commit task content change to queue
 
@@ -492,13 +513,41 @@ def commit_labels_update(api, overview_task_ids, overview_task_labels):
     for task_id in filtered_overview_ids:
         labels = overview_task_labels[task_id]
 
+        # Convert label IDs to label names for Sync API v1
+        # The REST API v2 returns IDs, but Sync API v1 expects names
+        label_names = []
+        for label in labels:
+            if hasattr(api, 'label_id_to_name') and label in api.label_id_to_name:
+                # It's an ID, convert to name
+                label_names.append(api.label_id_to_name[label])
+            else:
+                # It's already a name (or unknown), keep it
+                label_names.append(label)
+
         # api.update_task(task_id=task_id, labels=labels) # Not using REST API, since we would get too many single requests
         uuid = str(time.perf_counter())  # Create unique request id
         data = {"type": "item_update", "uuid": uuid,
-                "args": {"id": task_id, "labels": labels}}
+                "args": {"id": task_id, "labels": label_names}}
         api.queue.append(data)
 
     return api
+
+
+# Call status URL for monitoring
+
+
+def call_status_url(url):
+    """Call status URL for monitoring purposes."""
+    if not url:
+        return
+    
+    try:
+        response = requests.get(url, timeout=10)
+        logging.debug(f'Status URL called successfully: {url} (status: {response.status_code})')
+    except requests.exceptions.RequestException as e:
+        logging.warning(f'Failed to call status URL {url}: {e}')
+    except Exception as e:
+        logging.warning(f'Unexpected error calling status URL {url}: {e}')
 
 
 # Update tasks in batch with Todoist Sync API
@@ -524,11 +573,13 @@ def sync(api, chunk):
             '&commands=' + json.dumps(chunk)
 
         response = requests.post(
-            'https://api.todoist.com/sync/v9/sync', headers=headers, data=data)
+            'https://api.todoist.com/api/v1/sync', headers=headers, data=data)
 
         if response.status_code == 200:
             return response.json()
 
+        # Log error details for debugging
+        logging.error(f"Sync API error {response.status_code}: {response.text[:200]}")
         response.raise_for_status()
         return response.ok
 
@@ -554,23 +605,51 @@ def check_name(args, string, num):
             # Find any = or - symbol at the end of the string. Look at last 3 for projects, 2 for sections, and 1 for tasks
             regex = '[%s%s]{1,%s}$' % (args.s_suffix, args.p_suffix, str(num))
             re_ind = re.search(regex, string)
-            suffix = re_ind[0]
-
-            # Somebody put fewer characters than intended. Take last character and apply for every missing one.
-            if len(suffix) < num:
-                suffix += suffix[-1] * (num - len(suffix))
-
-            current_type = ''
-            for s in suffix:
-                if s == args.s_suffix:
-                    current_type += 's'
-                elif s == args.p_suffix:
-                    current_type += 'p'
+            
+            # Check if this project should be excluded based on ignore_suffix
+            if args.all_projects and num == 3 and args.ignore_suffix and string.endswith("_ignore"):
+                # Project has the ignore suffix, so don't apply the all_projects logic
+                if re_ind:
+                    suffix = re_ind[0]
+                    
+                    # Somebody put fewer characters than intended. Take last character and apply for every missing one.
+                    if len(suffix) < num:
+                        suffix += suffix[-1] * (num - len(suffix))
+                    
+                    current_type = ''
+                    for s in suffix:
+                        if s == args.s_suffix:
+                            current_type += 's'
+                        elif s == args.p_suffix:
+                            current_type += 'p'
+                else:
+                    current_type = None
+            # If all_projects is enabled and we're checking a project (num=3), and no suffix is found,
+            # treat it as sequential by default
+            elif args.all_projects and num == 3 and not re_ind:
+                current_type = 's' * num
+            else:
+                # Process normally if suffix is found or all_projects is not enabled
+                if re_ind:
+                    suffix = re_ind[0]
+                    
+                    # Somebody put fewer characters than intended. Take last character and apply for every missing one.
+                    if len(suffix) < num:
+                        suffix += suffix[-1] * (num - len(suffix))
+                    
+                    current_type = ''
+                    for s in suffix:
+                        if s == args.s_suffix:
+                            current_type += 's'
+                        elif s == args.p_suffix:
+                            current_type += 'p'
+                else:
+                    current_type = None
 
         # Always return a three letter string
-        if len(current_type) == 2:
+        if current_type and len(current_type) == 2:
             current_type = 'x' + current_type
-        elif len(current_type) == 1:
+        elif current_type and len(current_type) == 1:
             current_type = 'xx' + current_type
 
     except:
@@ -660,11 +739,12 @@ def get_task_type(args, connection, task, section, project):
 # Logic to track addition of a label to a task
 
 
-def add_label(task, label, overview_task_ids, overview_task_labels):
-    if label not in task.labels:
-        labels = task.labels  # To also copy other existing labels
+def add_label(task, label_id, overview_task_ids, overview_task_labels):
+    # task.labels contains IDs as strings from REST API v2
+    if label_id not in task.labels:
+        labels = task.labels.copy()  # Copy to avoid modifying original
         logging.debug('Updating \'%s\' with label', task.content)
-        labels.append(label)
+        labels.append(label_id)
 
         try:
             overview_task_ids[task.id] += 1
@@ -675,11 +755,12 @@ def add_label(task, label, overview_task_ids, overview_task_labels):
 # Logic to track removal of a label from a task
 
 
-def remove_label(task, label, overview_task_ids, overview_task_labels):
-    if label in task.labels:
-        labels = task.labels
+def remove_label(task, label_id, overview_task_ids, overview_task_labels):
+    # task.labels contains IDs as strings from REST API v2
+    if label_id in task.labels:
+        labels = task.labels.copy()  # Copy to avoid modifying original
         logging.debug('Removing \'%s\' of its label', task.content)
-        labels.remove(label)
+        labels.remove(label_id)
 
         try:
             overview_task_ids[task.id] -= 1
@@ -694,8 +775,8 @@ def remove_label(task, label, overview_task_ids, overview_task_labels):
 def check_header(api, model):
     header_all_in_level = False
     unheader_all_in_level = False
-    regex_a = '(^[*]{2}\s*)(.*)'
-    regex_b = '(^\-\*\s*)(.*)'
+    regex_a = r'(^[*]{2}\s*)(.*)'
+    regex_b = r'(^\-\*\s*)(.*)'
 
     try:
         if isinstance(model, Task):
@@ -987,7 +1068,8 @@ def autodoist_magic(args, api, connection):
     # Preallocate dictionaries and other values
     overview_task_ids = {}
     overview_task_labels = {}
-    next_action_label = args.label
+    # Use label ID for all operations (REST API v2 uses IDs)
+    next_action_label = args.label_id if hasattr(args, 'label_id') else args.label
     regen_labels_id = args.regen_label_names
     first_found = [False, False, False]
     api.queue = []
@@ -995,9 +1077,10 @@ def autodoist_magic(args, api, connection):
 
     # Get all todoist info
     try:
-        all_projects = api.get_projects()  # To save on request to stay under the limit
-        all_sections = api.get_sections()  # To save on request to stay under the limit
-        all_tasks = api.get_tasks()
+        # In API v3, get_*() methods return paginators that yield pages (lists)
+        all_projects = [item for page in api.get_projects() for item in page]
+        all_sections = [item for page in api.get_sections() for item in page]
+        all_tasks = [item for page in api.get_tasks() for item in page]
 
     except Exception as error:
         logging.error(error)
@@ -1052,7 +1135,9 @@ def autodoist_magic(args, api, connection):
         # Get all sections and add the 'None' section too.
         try:
             sections = [s for s in all_sections if s.project_id == project.id]
-            sections.insert(0, Section(None, None, 0, project.id))
+            # In API v3, Section requires: id, name, project_id, is_collapsed, order
+            # Create a fake section for tasks without a section
+            sections.insert(0, Section(id=None, name=None, project_id=project.id, is_collapsed=False, order=0))
         except Exception as error:
             logging.debug(error)
 
@@ -1097,8 +1182,9 @@ def autodoist_magic(args, api, connection):
             # Sort by parent_id and child order
             # In the past, Todoist used to screw up the tasks orders, so originally I processed parentless tasks first such that children could properly inherit porperties.
             # With the new API this seems to be in order, but I'm keeping this just in case for now. TODO: Could be used for optimization in the future.
+            # In API v3, IDs are strings, so don't convert to int
             section_tasks = sorted(section_tasks, key=lambda x: (
-                int(x.parent_id), x.order))
+                x.parent_id if x.parent_id else "", x.order))
 
             # If a type has changed, clean all tasks in this section for good measure
             if next_action_label is not None:
@@ -1264,8 +1350,8 @@ def autodoist_magic(args, api, connection):
                                             task, next_action_label, overview_task_ids, overview_task_labels)
 
                                 elif dominant_type[1] == 'p':
-                                    add_label(
-                                        task, next_action_label, overview_task_ids, overview_task_labels)
+                                    add_label(task, next_action_label,
+                                              overview_task_ids, overview_task_labels)
 
                             # If indicated on section level
                             if dominant_type[0] == 'x' and dominant_type[1] == 's':
@@ -1377,7 +1463,7 @@ def autodoist_magic(args, api, connection):
                     # If start-date has not passed yet, remove label
                     try:
                         f1 = re.search(
-                            'start=(\d{2}[-]\d{2}[-]\d{4})', task.content)
+                            r'start=(\d{2}[-]\d{2}[-]\d{4})', task.content)
                         if f1:
                             start_date = f1.groups()[0]
                             start_date = datetime.strptime(
@@ -1400,7 +1486,7 @@ def autodoist_magic(args, api, connection):
                     if task.due is not None:
                         try:
                             f2 = re.search(
-                                'start=due-(\d+)([dw])', task.content)
+                                r'start=due-(\d+)([dw])', task.content)
 
                             if f2:
                                 offset = f2.groups()[0]
@@ -1483,6 +1569,12 @@ def main():
                         action='store_true')
     parser.add_argument('--inbox', help='the method the Inbox should be processed with.',
                         default=None, choices=['parallel', 'sequential'])
+    parser.add_argument('--all_projects', help='apply label to all projects, regardless of suffix.',
+                        action='store_true')
+    parser.add_argument('--ignore_suffix', help='exclude projects with suffix "_ignore" when all_projects is enabled.',
+                        action='store_true')
+    parser.add_argument('--status_url', help='URL to call after each sync loop iteration for monitoring.',
+                        type=str)
 
     args = parser.parse_args()
 
@@ -1546,6 +1638,9 @@ def main():
         else:
             logging.info('No changes in queue, skipping sync.')
 
+        # Call status URL for monitoring
+        call_status_url(args.status_url)
+
         # If onetime is set, exit after first execution.
         if args.onetime:
             break
@@ -1561,6 +1656,10 @@ def main():
             sleep_time = args.delay - delta_time
             logging.debug('Sleeping for %d seconds', sleep_time)
             time.sleep(sleep_time)
+
+        # Call status URL for monitoring (after each loop iteration)
+        call_status_url(args.status_url)
+
 
 
 if __name__ == '__main__':

@@ -175,9 +175,23 @@ If you want to hide all tasks due in the future:
 
     python autodoist.py --hf <NUMBER_OF_DAYS>
 
+If you want to apply labels to all projects, regardless of whether they have a suffix or not:
+
+    python autodoist.py --all_projects
+
+If you want to exclude projects with suffix "_ignore" when using --all_projects:
+
+    python autodoist.py --all_projects --ignore_suffix
+
 In addition, if you experience issues with syncing you can increase the api syncing time (default 5 seconds):
     
     python autodoist.py --delay <time in seconds>
+
+For monitoring purposes, you can specify a URL that will be called after each sync loop iteration to verify autodoist is running:
+
+    python autodoist.py --status_url <monitoring_url>
+
+This will make a GET request to the specified URL every loop iteration (default every 5 seconds), regardless of whether there were changes to sync. This helps detect when the autodoist process has stopped or crashed.
 
 For all arguments, please check out the help:
 
