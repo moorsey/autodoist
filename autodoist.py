@@ -18,20 +18,11 @@ import os
 import re
 import json
 
-
-#chunking code to meet API limits of 100 calls per request
-
-def sync_in_chunks(api):
-    chunk_size = 99  # Maximum commands per request
-    while api.queue:
-        chunk = api.queue[:chunk_size]  # Get the next chunk
-        api.queue = api.queue[chunk_size:]  # Remove the processed chunk from the queue
-        sync(api, chunk)  # Sync the current chunk
-
-        logging.info('Synced chunk of %d commands.', chunk_size)
-
 # Connect to SQLite database
 
+def chunker(seq, size):
+    """Yield successive n-sized chunks from seq."""
+    return (seq[pos:pos + size] for pos in range(0, len(seq), size))
 
 def create_connection(path):
     connection = None
@@ -396,18 +387,7 @@ def initialise_api(args):
     if args.label is not None:
 
         # Verify that the next action label exists; ask user if it needs to be created
-        # Get the label ID - keep args.label as the name (for checking with REST API)
-        label_id = verify_label_existance(api, args.label, 1)
-        # Store the label ID for Sync API v1 (which uses IDs)
-        args.label_id = label_id
-        # Store label name for later use
-        args.label_name = args.label
-        logging.debug(f"Using label '{args.label}' with ID: {args.label_id}")
-
-        # Create ID to name mapping for all labels
-        all_labels = [label for page in api.get_labels() for label in page]
-        api.label_id_to_name = {label.id: label.name for label in all_labels}
-        api.label_name_to_id = {label.name: label.id for label in all_labels}
+        verify_label_existance(api, args.label, 1)
 
     # TODO: Disabled for now
     # # If regeneration mode is used, verify labels
@@ -513,21 +493,10 @@ def commit_labels_update(api, overview_task_ids, overview_task_labels):
     for task_id in filtered_overview_ids:
         labels = overview_task_labels[task_id]
 
-        # Convert label IDs to label names for Sync API v1
-        # The REST API v2 returns IDs, but Sync API v1 expects names
-        label_names = []
-        for label in labels:
-            if hasattr(api, 'label_id_to_name') and label in api.label_id_to_name:
-                # It's an ID, convert to name
-                label_names.append(api.label_id_to_name[label])
-            else:
-                # It's already a name (or unknown), keep it
-                label_names.append(label)
-
         # api.update_task(task_id=task_id, labels=labels) # Not using REST API, since we would get too many single requests
         uuid = str(time.perf_counter())  # Create unique request id
         data = {"type": "item_update", "uuid": uuid,
-                "args": {"id": task_id, "labels": label_names}}
+                "args": {"id": task_id, "labels": labels}}
         api.queue.append(data)
 
     return api
@@ -552,40 +521,57 @@ def call_status_url(url):
 
 # Update tasks in batch with Todoist Sync API
 
-def sync(api, chunk):
-    # # This approach does not seem to work correctly.
-    # BASE_URL = "https://api.todoist.com"
-    # SYNC_VERSION = "v9"
-    # SYNC_API = urljoin(BASE_URL, f"/sync/{SYNC_VERSION}/")
-    # SYNC_ENDPOINT = "sync"
-    # endpoint = urljoin(SYNC_API, SYNC_ENDPOINT)
-    # task_data = post(api._session, endpoint, api._token, data=data)
+
+def sync(api):
+    def chunker(seq, size):
+        return (seq[pos:pos + size] for pos in range(0, len(seq), size))
 
     try:
-        bearer_token = 'Bearer %s' % api._token
+        # If there's nothing to sync, just do a normal empty sync to get updates
+        if not api.queue:
+            full_queue = [[]] 
+        else:
+            # Split the items into chunks of 99
+            full_queue = list(chunker(api.queue, 99))
 
+        last_response = None
+        bearer_token = 'Bearer %s' % api._token
         headers = {
             'Authorization': bearer_token,
             'Content-Type': 'application/x-www-form-urlencoded',
         }
 
-        data = 'sync_token=' + api.sync_token + \
-            '&commands=' + json.dumps(chunk)
+        for chunk in full_queue:
+            # Prepare the data for this specific chunk
+            data = {
+                'sync_token': api.sync_token,
+                'resource_types': '["all"]',
+                'commands': json.dumps(chunk)
+            }
 
-        response = requests.post(
-            'https://api.todoist.com/api/v1/sync', headers=headers, data=data)
+            response = requests.post(
+                'https://api.todoist.com/api/v1/sync', 
+                headers=headers, 
+                data=data
+            )
 
-        if response.status_code == 200:
-            return response.json()
+            if response.status_code == 200:
+                last_response = response.json()
+                # Important: Update the sync_token so the next chunk 
+                # knows about the changes from the previous one
+                api.sync_token = last_response.get('sync_token', api.sync_token)
+            else:
+                logging.error(f"Sync API error {response.status_code}: {response.text[:200]}")
+                response.raise_for_status()
 
-        # Log error details for debugging
-        logging.error(f"Sync API error {response.status_code}: {response.text[:200]}")
-        response.raise_for_status()
-        return response.ok
+        # Clear the queue after all chunks are sent
+        api.queue = []
+        
+        # Return the final response so the rest of the script has the latest state
+        return last_response
 
     except Exception as e:
-        logging.exception(
-            'Error trying to sync with Todoist API: %s' % str(e))
+        logging.exception('Error trying to sync with Todoist API: %s' % str(e))
         quit()
 
 # Find the type based on name suffix.
@@ -739,12 +725,11 @@ def get_task_type(args, connection, task, section, project):
 # Logic to track addition of a label to a task
 
 
-def add_label(task, label_id, overview_task_ids, overview_task_labels):
-    # task.labels contains IDs as strings from REST API v2
-    if label_id not in task.labels:
-        labels = task.labels.copy()  # Copy to avoid modifying original
+def add_label(task, label, overview_task_ids, overview_task_labels):
+    if label not in task.labels:
+        labels = task.labels  # Reference, not copy — sequential propagation relies on mutating task.labels in-place
         logging.debug('Updating \'%s\' with label', task.content)
-        labels.append(label_id)
+        labels.append(label)
 
         try:
             overview_task_ids[task.id] += 1
@@ -755,12 +740,11 @@ def add_label(task, label_id, overview_task_ids, overview_task_labels):
 # Logic to track removal of a label from a task
 
 
-def remove_label(task, label_id, overview_task_ids, overview_task_labels):
-    # task.labels contains IDs as strings from REST API v2
-    if label_id in task.labels:
-        labels = task.labels.copy()  # Copy to avoid modifying original
+def remove_label(task, label, overview_task_ids, overview_task_labels):
+    if label in task.labels:
+        labels = task.labels  # Reference, not copy — sequential propagation relies on mutating task.labels in-place
         logging.debug('Removing \'%s\' of its label', task.content)
-        labels.remove(label_id)
+        labels.remove(label)
 
         try:
             overview_task_ids[task.id] -= 1
@@ -1068,8 +1052,7 @@ def autodoist_magic(args, api, connection):
     # Preallocate dictionaries and other values
     overview_task_ids = {}
     overview_task_labels = {}
-    # Use label ID for all operations (REST API v2 uses IDs)
-    next_action_label = args.label_id if hasattr(args, 'label_id') else args.label
+    next_action_label = args.label
     regen_labels_id = args.regen_label_names
     first_found = [False, False, False]
     api.queue = []
@@ -1155,18 +1138,25 @@ def autodoist_magic(args, api, connection):
                 except:
                     pass
 
-            # Check db existance
-            db_check_existance(connection, section)
+            # Skip DB and type operations for the fake None section (tasks without a section)
+            if section.id is not None:
+                # Check db existance
+                db_check_existance(connection, section)
 
-            # Check if we need to (un)header entire secion
-            api, header_all_in_s, unheader_all_in_s = check_header(
-                api, section)
+                # Check if we need to (un)header entire secion
+                api, header_all_in_s, unheader_all_in_s = check_header(
+                    api, section)
 
-            # Get section type
-            if next_action_label:
-                section_type, section_type_changed = get_section_type(
-                    args, connection, section, project)
+                # Get section type
+                if next_action_label:
+                    section_type, section_type_changed = get_section_type(
+                        args, connection, section, project)
+                else:
+                    section_type = None
+                    section_type_changed = 0
             else:
+                header_all_in_s = False
+                unheader_all_in_s = False
                 section_type = None
                 section_type_changed = 0
 
@@ -1624,7 +1614,7 @@ def main():
 
         # Sync all queued up changes
         if api.queue:
-            sync_in_chunks(api)
+            sync(api)
 
         num_changes = len(api.queue)+len(api.overview_updated_ids)
 
