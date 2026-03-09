@@ -524,26 +524,24 @@ def call_status_url(url):
 
 def sync(api):
     def chunker(seq, size):
-        return (seq[pos:pos + size] for pos in range(0, len(seq), size))
+        return [seq[pos:pos + size] for pos in range(0, len(seq), size)]
 
     try:
-        # If there's nothing to sync, just do a normal empty sync to get updates
-        if not api.queue:
-            full_queue = [[]] 
+        # 1. Prepare chunks
+        commands_to_send = list(api.queue)
+        if commands_to_send:
+            chunks = chunker(commands_to_send, 99)
+            logging.info(f"Syncing {len(commands_to_send)} commands in {len(chunks)} batches.")
         else:
-            # Split the items into chunks of 99
-            full_queue = list(chunker(api.queue, 99))
+            # Even with no commands, we sync once to get latest remote state
+            chunks = [[]]
 
-        last_response = None
+        full_combined_response = {}
         bearer_token = 'Bearer %s' % api._token
-        headers = {
-            'Authorization': bearer_token,
-            'Content-Type': 'application/x-www-form-urlencoded',
-        }
+        headers = {'Authorization': bearer_token}
 
-        for chunk in full_queue:
-            # Prepare the data for this specific chunk
-            data = {
+        for chunk in chunks:
+            payload = {
                 'sync_token': api.sync_token,
                 'resource_types': '["all"]',
                 'commands': json.dumps(chunk)
@@ -552,23 +550,30 @@ def sync(api):
             response = requests.post(
                 'https://api.todoist.com/api/v1/sync', 
                 headers=headers, 
-                data=data
+                data=payload
             )
 
             if response.status_code == 200:
-                last_response = response.json()
-                # Important: Update the sync_token so the next chunk 
-                # knows about the changes from the previous one
-                api.sync_token = last_response.get('sync_token', api.sync_token)
+                res_json = response.json()
+                # Update token so next chunk is incremental to this one
+                api.sync_token = res_json.get('sync_token', api.sync_token)
+                
+                # Merge this response into our "master" response
+                # This ensures the script sees ALL tasks/labels, not just the last batch
+                for key, value in res_json.items():
+                    if isinstance(value, list):
+                        full_combined_response.setdefault(key, []).extend(value)
+                    else:
+                        full_combined_response[key] = value
             else:
-                logging.error(f"Sync API error {response.status_code}: {response.text[:200]}")
+                logging.error(f"Sync API error {response.status_code}: {response.text}")
                 response.raise_for_status()
 
-        # Clear the queue after all chunks are sent
+        # 2. Clear the queue now that we are done
         api.queue = []
         
-        # Return the final response so the rest of the script has the latest state
-        return last_response
+        # 3. Return the combined data so Hide Future can see all tasks
+        return full_combined_response
 
     except Exception as e:
         logging.exception('Error trying to sync with Todoist API: %s' % str(e))
